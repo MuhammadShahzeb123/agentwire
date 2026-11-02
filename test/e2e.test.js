@@ -1,56 +1,101 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createHub } from '../src/hub.js';
+import { createClient } from '../src/client.js';
+import { signRequest } from '../src/crypto.js';
 
-const TOKEN = 'secret';
-let base, hub;
-test.before(async () => { hub = createHub({ token: TOKEN }); await new Promise(r => hub.server.listen(0, r)); base = `http://127.0.0.1:${hub.server.address().port}`; });
+const ADMIN = 'admin-secret-0123456789';
+let base, hub, keys = {};
+const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-'));
+test.before(async () => {
+  hub = createHub({ token: ADMIN }); await new Promise(r => hub.server.listen(0, r));
+  base = `http://127.0.0.1:${hub.server.address().port}`;
+  const admin = createClient({ url: base, key: ADMIN, admin: true, home });
+  for (const id of ['devin', 'grok', 'codex', 'claude']) keys[id] = (await admin.api('invite', { agent_id: id })).key;
+});
 test.after(() => hub.server.close());
 
-const rpc = async (agent, method, params, id = 1) => {
-  const r = await fetch(`${base}/mcp?agent=${agent}`, { method: 'POST', headers: { authorization: 'Bearer ' + TOKEN, 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id, method, params }) });
-  return r.json();
-};
+// Compat remote MCP client: key in URL, no local crypto.
+const rpc = async (agent, method, params, id = 1) => (await (await fetch(`${base}/mcp?key=${keys[agent]}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id, method, params }) })).json());
 const tool = async (agent, name, args = {}) => { const r = await rpc(agent, 'tools/call', { name, arguments: args }); return { err: r.result.isError, data: r.result.isError ? r.result.content[0].text : JSON.parse(r.result.content[0].text) }; };
 
-test('rejects bad token', async () => { assert.equal((await fetch(base + '/mcp', { method: 'POST', body: '{}' })).status, 401); });
+test('auth: rejects missing, wrong, replayed, stale and tampered requests', async () => {
+  assert.equal((await fetch(base + '/mcp', { method: 'POST', body: '{}' })).status, 401);
+  assert.equal((await fetch(base + '/mcp?key=awk_nope', { method: 'POST', body: '{}' })).status, 401);
+  const body = '{"jsonrpc":"2.0","id":1,"method":"ping"}';
+  const h = signRequest(keys.codex, { method: 'POST', path: '/mcp', body, agent: 'codex' });
+  assert.equal((await fetch(base + '/mcp', { method: 'POST', headers: h, body })).status, 200);
+  assert.equal((await fetch(base + '/mcp', { method: 'POST', headers: h, body })).status, 401, 'replay');
+  const h2 = signRequest(keys.codex, { method: 'POST', path: '/mcp', body, agent: 'codex' });
+  assert.equal((await fetch(base + '/mcp', { method: 'POST', headers: h2, body: body.replace('ping', 'tools/list') })).status, 401, 'tamper');
+  const h3 = signRequest(keys.codex, { method: 'POST', path: '/mcp', body, agent: 'codex' }); h3['x-aw-ts'] = String(Date.now() - 3600e3);
+  assert.equal((await fetch(base + '/mcp', { method: 'POST', headers: h3, body })).status, 401, 'stale');
+  const h4 = signRequest(keys.codex, { method: 'POST', path: '/mcp', body, agent: 'devin' });
+  assert.equal((await fetch(base + '/mcp', { method: 'POST', headers: h4, body })).status, 401, 'impersonation');
+});
 
-test('HTTP MCP: initialize, list tools, two agents chat', async () => {
+test('agents cannot use admin tools or pick another identity', async () => {
+  assert.ok((await tool('devin', 'invite_agent', { agent_id: 'x' })).err);
+  assert.equal((await tool('devin', 'whoami', { as: 'grok' })).data.agent_id, 'devin');
+});
+
+test('compat HTTP MCP: chat, wait, reply, threads, at-rest encryption', async () => {
   assert.equal((await rpc('devin', 'initialize', {})).result.serverInfo.name, 'agentwire');
-  assert.ok((await rpc('devin', 'tools/list', {})).result.tools.some(t => t.name === 'wait_for_message'));
-  await tool('devin', 'register_agent', { description: 'flagship models' });
-  await tool('grok', 'register_agent', { description: 'browser + accounts' });
-  assert.equal((await tool('devin', 'list_agents')).data.length, 2);
-  assert.ok((await tool('devin', 'send_message', { to: 'nobody', body: 'x' })).err);
   const waiting = tool('grok', 'wait_for_message', { timeout_seconds: 5 });
   const sent = (await tool('devin', 'send_message', { to: 'grok', body: 'book me a table' })).data;
-  const got = (await waiting).data;
-  assert.equal(got[0].body, 'book me a table');
-  assert.equal((await tool('grok', 'check_inbox')).data.length, 0, 'marked read');
+  assert.equal((await waiting).data[0].body, 'book me a table');
+  const row = hub.db.prepare('SELECT body FROM messages WHERE id=?').get(sent.id);
+  assert.ok(row.body.startsWith('rest1:') && !row.body.includes('table'), 'encrypted at rest');
+  assert.equal((await tool('grok', 'check_inbox')).data.length, 0);
   await tool('grok', 'reply', { message_id: sent.id, body: 'done' });
-  const back = (await tool('devin', 'check_inbox')).data;
-  assert.equal(back[0].body, 'done'); assert.equal(back[0].thread_id, sent.thread_id);
+  assert.equal((await tool('devin', 'check_inbox')).data[0].thread_id, sent.thread_id);
   assert.equal((await tool('devin', 'get_thread', { thread_id: sent.thread_id })).data.length, 2);
 });
 
-test('offline queue + REST API', async () => {
-  const h = { authorization: 'Bearer ' + TOKEN, 'content-type': 'application/json', 'x-agent-id': 'codex' };
-  await fetch(base + '/api/register', { method: 'POST', headers: h, body: '{}' });
-  await fetch(base + '/api/send', { method: 'POST', headers: { ...h, 'x-agent-id': 'claude' }, body: JSON.stringify({ to: 'codex', body: 'hi while you were away' }) });
-  const inbox = await (await fetch(base + '/api/inbox', { headers: h })).json();
-  assert.equal(inbox[0].body, 'hi while you were away');
+test('revoked key stops working', async () => {
+  const admin = createClient({ url: base, key: ADMIN, admin: true, home });
+  const k = (await admin.api('invite', { agent_id: 'temp' })).key;
+  assert.equal((await fetch(`${base}/api/whoami?key=${k}`)).status, 200);
+  await admin.api('revoke', { agent_id: 'temp' });
+  assert.equal((await fetch(`${base}/api/whoami?key=${k}`)).status, 401);
 });
 
-test('stdio MCP bridge end to end', async () => {
-  const p = spawn(process.execPath, ['src/cli.js', 'mcp'], { env: { ...process.env, AGENTWIRE_URL: base, AGENTWIRE_TOKEN: TOKEN, AGENTWIRE_AGENT: 'claude' } });
+function stdio(agent) {
+  const p = spawn(process.execPath, ['src/cli.js', 'mcp'], { env: { ...process.env, AGENTWIRE_URL: base, AGENTWIRE_KEY: keys[agent], AGENTWIRE_AGENT: agent, AGENTWIRE_HOME: home } });
   const lines = []; let buf = '';
   p.stdout.on('data', d => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { lines.push(JSON.parse(buf.slice(0, i))); buf = buf.slice(i + 1); } });
-  const call = (id, method, params) => { p.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); return new Promise(r => { const t = setInterval(() => { const m = lines.find(l => l.id === id); if (m) { clearInterval(t); r(m); } }, 10); }); };
-  await call(1, 'initialize', {});
-  await call(2, 'tools/call', { name: 'register_agent', arguments: {} });
-  const r = await call(3, 'tools/call', { name: 'send_message', arguments: { to: 'devin', body: 'from claude via stdio' } });
-  assert.ok(!r.result.isError, JSON.stringify(r));
-  assert.equal((await tool('devin', 'check_inbox')).data[0].body, 'from claude via stdio');
-  p.kill();
+  let n = 0;
+  const call = (method, params) => { const id = ++n; p.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); return new Promise(r => { const t = setInterval(() => { const m = lines.find(l => l.id === id); if (m) { clearInterval(t); r(m); } }, 10); }); };
+  const t = async (name, args = {}) => JSON.parse((await call('tools/call', { name, arguments: args })).result.content[0].text);
+  return { p, call, t };
+}
+
+test('stdio clients: end-to-end encrypted round trip, hub only sees ciphertext', async () => {
+  const claude = stdio('claude'), codex = stdio('codex');
+  await claude.call('initialize', {}); await codex.call('initialize', {});
+  const sent = await claude.t('send_message', { to: 'codex', body: 'secret plan from claude' });
+  assert.equal(sent.encryption, 'end-to-end encrypted');
+  const row = hub.db.prepare('SELECT body FROM messages WHERE id=?').get(sent.id);
+  assert.ok(row.body.startsWith('{"aw_e2e":1') && !row.body.includes('secret'));
+  const got = await codex.t('check_inbox');
+  assert.equal(got[0].body, 'secret plan from claude'); assert.equal(got[0].e2e, true);
+  const rep = await codex.t('reply', { message_id: sent.id, body: 'ack' });
+  assert.equal(rep.encryption, 'end-to-end encrypted');
+  assert.equal((await claude.t('check_inbox'))[0].body, 'ack');
+  const thread = await claude.t('get_thread', { thread_id: sent.thread_id });
+  assert.deepEqual(thread.map(m => m.body), ['secret plan from claude', 'ack']);
+  // stdio -> compat client falls back to plaintext with a warning
+  const fb = await claude.t('send_message', { to: 'devin', body: 'hi devin' });
+  assert.match(fb.encryption, /WITHOUT end-to-end/);
+  assert.equal((await tool('devin', 'check_inbox')).data[0].body, 'hi devin');
+  claude.p.kill(); codex.p.kill();
+});
+
+test('not indexable', async () => {
+  const r = await fetch(base + '/robots.txt'); assert.match(await r.text(), /Disallow: \//);
+  assert.equal((await fetch(base + '/health')).headers.get('x-robots-tag'), 'noindex, nofollow');
 });

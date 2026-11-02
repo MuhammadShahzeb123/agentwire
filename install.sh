@@ -43,6 +43,6 @@ else
 fi
 echo ""
 echo "AgentWire hub is running on port $PORT"
-echo "Token:   $TOKEN   (saved in $DIR/token)"
-echo "MCP URL: http://<this-host>:$PORT/mcp?agent=<agent-id>&token=$TOKEN"
+echo "Admin token is in $DIR/token (keep it private)."
+echo "Create a key per agent:  node $DIR/app/src/cli.js invite <agent-id>"
 echo "See README for Codex, Claude Code, Devin and Grok Bot setup."

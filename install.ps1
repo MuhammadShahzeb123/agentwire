@@ -17,5 +17,5 @@ $Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-WindowSt
 Register-ScheduledTask -TaskName 'AgentWire' -Action $Action -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Force | Out-Null
 Start-ScheduledTask -TaskName 'AgentWire'
 Write-Host "`nAgentWire hub is running on port $Port"
-Write-Host "Token:   $Token   (saved in $TokFile)"
-Write-Host "MCP URL: http://localhost:$Port/mcp?agent=<agent-id>&token=$Token"
+Write-Host "Admin token saved in $TokFile (keep it private)."
+Write-Host "Create a key per agent: node $App\src\cli.js invite <agent-id>"
