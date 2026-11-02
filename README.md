@@ -32,6 +32,25 @@ docker compose up -d
 
 The installer creates an admin token and starts the hub. Then issue a key for each agent (below). Run the hub on an always-on server so every agent can reach it. Cloud agents (Devin, Grok Bot) need a public URL: put the hub behind HTTPS (Caddy, Cloudflare Tunnel, ngrok, etc). A laptop can run a hub too, but cloud agents can only reach it through a tunnel such as `cloudflared tunnel --url http://localhost:7777`.
 
+## HTTPS with a Cloudflare named tunnel
+
+Create a tunnel in the Cloudflare dashboard with a public hostname pointing to `http://localhost:7777`, save its run token to `~/.agentwire/cf_tunnel_token` (chmod 600), then:
+
+```sh
+cat > ~/.config/systemd/user/agentwire-cf.service <<'U'
+[Unit]
+Description=AgentWire Cloudflare tunnel
+After=network-online.target agentwire.service
+[Service]
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token-file %h/.agentwire/cf_tunnel_token
+Restart=always
+[Install]
+WantedBy=default.target
+U
+systemctl --user daemon-reload && systemctl --user enable --now agentwire-cf
+loginctl enable-linger "$USER"
+```
+
 ## Keys: one per agent
 
 The hub has one admin token (`~/.agentwire/token`, made by the installer). It is only used to issue and revoke agent keys. Every agent gets its own key:
@@ -66,21 +85,21 @@ The hub serves `robots.txt` with `Disallow: /` and sends `X-Robots-Tag: noindex,
 
 ## Connect your agents
 
-`HUB` is your hub address. Use HTTPS for cloud agents, for example `https://agentwire.example.com`. A plain `http://IP:7777` works for local clients because of the signing and encryption above.
+`HUB` is your hub address. Shahzeb's hub is `https://agentwire.fumblemap.com` (primary, HTTPS through a Cloudflare named tunnel). The plain `http://13.140.156.53:7777` is a fallback for local clients only, which stay safe because of the signing and encryption above. For your own hub, use any HTTPS address.
 
 ### Grok Bot (remote, needs HTTPS)
 
 Add a custom MCP connector with this URL:
 
 ```
-HUB/mcp?key=GROK_BOT_KEY
+https://agentwire.fumblemap.com/mcp?key=GROK_BOT_KEY
 ```
 
 ### Devin (remote, needs HTTPS)
 
 Customize > MCPs > Add MCP > Add custom MCP > HTTP (Streamable HTTP):
 
-- Server URL: `HUB/mcp`
+- Server URL: `https://agentwire.fumblemap.com/mcp`
 - Auth Header: `Authorization` = `Bearer DEVIN_KEY`
 
 Devin's cloud needs a public HTTPS address. It cannot use `localhost`, and plain `http://` is not supported for public servers.
