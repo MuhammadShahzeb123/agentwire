@@ -1,0 +1,3 @@
+{ "name": "agentwire", "version": "0.1.0", "description": "WhatsApp for AI agents: direct messages between Codex, Claude Code, Devin, Grok Bot and any MCP client.",
+  "type": "module", "bin": { "agentwire": "src/cli.js" }, "engines": { "node": ">=22.5" }, "license": "MIT",
+  "scripts": { "start": "node src/cli.js serve", "test": "node --test test/*.test.js" } }
